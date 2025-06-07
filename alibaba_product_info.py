@@ -203,6 +203,133 @@ def get_description_from_page(page):
         print(f"获取描述时出错: {str(e)}")
         return "未获取到"
 
+
+def extract_features_from_description(description):
+    """从商品描述中提取产品特点"""
+    features = []
+    sentences = re.split(r'[。\n]', description)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if 10 < len(sentence) < 100:
+            if not any(skip in sentence.lower() for skip in ['联系', '咨询', '价格', '¥', '$', '电话', 'qq', '微信']):
+                features.append(sentence)
+    return features[:5]
+
+
+def extract_image_context(img_element):
+    """提取图片前后相邻的文本内容"""
+    context = []
+    try:
+        parent = img_element.evaluate('node => node.parentElement')
+        if parent:
+            prev_text = parent.evaluate('node => node.previousSibling?.textContent || ""')
+            next_text = parent.evaluate('node => node.nextSibling?.textContent || ""')
+            for text in [prev_text, next_text]:
+                if text:
+                    text = text.strip()
+                    if len(text) > 5:
+                        context.append(text)
+    except Exception:
+        pass
+    return context
+
+
+def extract_selling_points_from_page(page):
+    """从详情页提取规格参数、卖点和特点信息"""
+    selling_points = {
+        'specifications': {},
+        'text_points': [],
+        'features': [],
+        'image_points': []
+    }
+    try:
+        spec_rows = page.query_selector_all('.od-pc-attribute-item')
+        for row in spec_rows:
+            try:
+                key = row.query_selector('.od-pc-attribute-item-key')
+                value = row.query_selector('.od-pc-attribute-item-val')
+                if key and value:
+                    k = key.text_content().strip().rstrip('：:')
+                    v = value.text_content().strip()
+                    if k and v:
+                        selling_points['specifications'][k] = v
+            except Exception:
+                continue
+
+        selectors = [
+            '.detail-desc-decorate-richtext',
+            '.desc-lazyload-container',
+            '.detail-desc-decorate-content'
+        ]
+        for selector in selectors:
+            elements = page.query_selector_all(selector)
+            for element in elements:
+                try:
+                    text = element.text_content().strip()
+                    if text:
+                        lines = text.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if any(k in line for k in ['特点', '优点', '功能', '适用', '优势', '特色', '特征']):
+                                if 10 < len(line) < 200:
+                                    selling_points['text_points'].append(line)
+                            elif len(line) > 10 and not any(skip in line.lower() for skip in ['联系', '咨询', '价格', '¥', '$', '电话']):
+                                selling_points['features'].append(line)
+                except Exception:
+                    continue
+
+        detail_images = page.query_selector_all('.detail-desc-decorate-richtext img')
+        for img in detail_images:
+            try:
+                src = img.get_attribute('src')
+                alt = img.get_attribute('alt') or ''
+                if src:
+                    if src.startswith('//'):
+                        src = 'https:' + src
+                    selling_points['image_points'].append({
+                        'url': src,
+                        'alt': alt,
+                        'context': extract_image_context(img)
+                    })
+            except Exception:
+                continue
+
+        selling_points['text_points'] = list(set(selling_points['text_points']))
+        selling_points['features'] = list(set(selling_points['features']))
+    except Exception as e:
+        print(f"提取卖点信息时出错: {e}")
+    return selling_points
+
+
+def generate_product_prompt(product_info, selling_points, image_index=0):
+    """根据商品信息和卖点生成图片提示词"""
+    elements = []
+    if product_info.get('title'):
+        elements.append(f"Product: {product_info['title']}.")
+
+    specs = selling_points.get('specifications', {})
+    important_specs = ['尺寸', '规格', '材质', '型号', 'Size', 'Material', 'Model']
+    for key in important_specs:
+        if key in specs:
+            elements.append(f"{key}: {specs[key]}.")
+
+    points = selling_points.get('text_points', [])
+    if points:
+        idx = image_index % len(points)
+        elements.append(f"Key selling point: {points[idx]}.")
+
+    features = selling_points.get('features', [])
+    if features:
+        idx = image_index % len(features)
+        elements.append(f"Feature to highlight: {features[idx]}.")
+
+    elements.append("Visual style: Ultra-realistic product photography, sharp focus, intricate details, professional studio lighting, clean background unless contextually relevant.")
+    elements.append("Composition: Dynamic angle if appropriate, or standard e-commerce shot. Highlight key product attributes visible in this specific image.")
+    elements.append("Impression: Commercial-grade, highly attractive, enticing for online shoppers.")
+    elements.append("Ensure all text in the generated image is in English, legible, and contextually correct if any text is part of the product design.")
+
+    return " ".join(elements)
+
 def get_alibaba_product_info(url, show_browser=True):
     """
     使用Playwright获取阿里巴巴商品信息
@@ -242,6 +369,12 @@ def get_alibaba_product_info(url, show_browser=True):
                 print("描述获取成功")
             else:
                 print("描述获取失败")
+
+            selling_points = extract_selling_points_from_page(page)
+            if description != "未获取到":
+                features = extract_features_from_description(description)
+                if features:
+                    selling_points['features'].extend(features)
             
             # 获取商品图片
             image_urls = []
@@ -264,7 +397,8 @@ def get_alibaba_product_info(url, show_browser=True):
                 'title': title,
                 'price': price,
                 'description': description,
-                'images': image_urls
+                'images': image_urls,
+                'selling_points': selling_points
             }
             
             # 打印获取到的信息
@@ -273,6 +407,13 @@ def get_alibaba_product_info(url, show_browser=True):
             print(f"价格: {result['price']}")
             print(f"描述: {result['description'][:200]}..." if result['description'] != "未获取到" else "描述: 未获取到")
             print(f"图片数量: {len(result['images'])}")
+            print(f"规格参数数量: {len(selling_points['specifications'])}")
+            print(f"文字卖点数量: {len(selling_points['text_points'])}")
+            print(f"商品特点数量: {len(selling_points['features'])}")
+            print(f"图片卖点数量: {len(selling_points['image_points'])}")
+
+            sample_prompt = generate_product_prompt(result, selling_points)
+            print(f"\n示例提示词: {sample_prompt}")
             
             try:
                 # 创建调试目录（如果不存在）
